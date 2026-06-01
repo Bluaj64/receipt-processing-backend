@@ -1,19 +1,19 @@
 import os
 import json
 import uuid
+import base64
 from datetime import datetime, timezone
 
 import boto3
 
+
 dynamodb = boto3.resource("dynamodb")
+s3 = boto3.client("s3")
 
-receipts_table = dynamodb.Table(
-    os.environ["RECEIPTS_TABLE"]
-)
+receipts_table = dynamodb.Table(os.environ["RECEIPTS_TABLE"])
+sessions_table = dynamodb.Table(os.environ["SESSIONS_TABLE"])
+receipt_images_bucket = os.environ["RECEIPT_IMAGES_BUCKET"]
 
-sessions_table = dynamodb.Table(
-    os.environ["SESSIONS_TABLE"]
-)
 
 def response(status_code, body):
     return {
@@ -25,53 +25,110 @@ def response(status_code, body):
         "body": json.dumps(body),
     }
 
-def get_token_from_event(event):
-    headers = event.get("headers") or {}
 
-    authorization = headers.get("authorization") or headers.get("Authorization")
-
-    if not authorization:
+def parse_body(event):
+    try:
+        return json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
         return None
 
-    if not authorization.startswith("Bearer "):
+
+def get_token_from_event(event):
+    headers = event.get("headers") or {}
+    authorization = headers.get("authorization") or headers.get("Authorization")
+
+    if not authorization or not authorization.startswith("Bearer "):
         return None
 
     return authorization.replace("Bearer ", "", 1).strip()
 
-def get_session(token):
-    result = sessions_table.get_item(
-        Key={"token": token}
-    )
 
+def get_session(token):
+    result = sessions_table.get_item(Key={"token": token})
     return result.get("Item")
 
-def handle_upload(event):
+
+def require_session(event):
     token = get_token_from_event(event)
 
     if not token:
-        return response(
-            401,
-            {"message": "Missing token"}
-        )
+        return None, response(401, {"message": "Missing token"})
 
     session = get_session(token)
 
     if not session:
-        return response(
-            401,
-            {"message": "Invalid session"}
-        )
+        return None, response(401, {"message": "Invalid session"})
+
+    return session, None
+
+
+def decode_image_base64(image_base64):
+    if "," in image_base64:
+        image_base64 = image_base64.split(",", 1)[1]
+
+    return base64.b64decode(image_base64)
+
+
+def get_file_extension(content_type):
+    if content_type == "image/png":
+        return "png"
+
+    if content_type in ["image/jpeg", "image/jpg"]:
+        return "jpg"
+
+    return None
+
+
+def handle_upload(event):
+    session, error_response = require_session(event)
+
+    if error_response:
+        return error_response
+
+    body = parse_body(event)
+
+    if body is None:
+        return response(400, {"message": "Invalid JSON body."})
+
+    image_base64 = body.get("imageBase64")
+    content_type = body.get("contentType", "image/png")
+
+    if not image_base64:
+        return response(400, {"message": "imageBase64 is required."})
+
+    file_extension = get_file_extension(content_type)
+
+    if not file_extension:
+        return response(400, {"message": "Only PNG and JPG images are supported."})
+
+    try:
+        image_bytes = decode_image_base64(image_base64)
+    except Exception:
+        return response(400, {"message": "Invalid base64 image."})
 
     receipt_id = str(uuid.uuid4())
+    user_email = session["email"]
+
+    image_s3_key = f"receipts/{user_email}/{receipt_id}.{file_extension}"
+
+    s3.put_object(
+        Bucket=receipt_images_bucket,
+        Key=image_s3_key,
+        Body=image_bytes,
+        ContentType=content_type,
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
 
     receipts_table.put_item(
         Item={
-            "userEmail": session["email"],
+            "userEmail": user_email,
             "receiptId": receipt_id,
-            "createdAt": datetime.now(
-                timezone.utc
-            ).isoformat(),
-            "status": "CREATED",
+            "createdAt": now,
+            "updatedAt": now,
+            "status": "IMAGE_UPLOADED",
+            "imageS3Key": image_s3_key,
+            "contentType": content_type,
         }
     )
 
@@ -79,10 +136,13 @@ def handle_upload(event):
         201,
         {
             "receiptId": receipt_id,
-            "message": "Receipt created",
+            "message": "Receipt image uploaded",
+            "imageS3Key": image_s3_key,
+            "status": "IMAGE_UPLOADED",
         },
     )
-    
+
+
 def lambda_handler(event, context):
     route = event.get("rawPath")
     method = event.get("requestContext", {}).get("http", {}).get("method")

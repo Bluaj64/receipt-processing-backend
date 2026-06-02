@@ -6,8 +6,8 @@ import urllib.request
 import urllib.error
 from decimal import Decimal
 from datetime import datetime, timezone
-
 import boto3
+from boto3.dynamodb.conditions import Key
 
 
 dynamodb = boto3.resource("dynamodb")
@@ -28,7 +28,7 @@ def response(status_code, body):
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
         },
-        "body": json.dumps(body),
+        "body": json.dumps(jsonify(body)),
     }
 
 
@@ -54,6 +54,17 @@ def get_session(token):
     return result.get("Item")
 
 
+def session_is_expired(session):
+    expires_at = session.get("expiresAt")
+
+    if not expires_at:
+        return False
+
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+
+    return int(expires_at) < now_epoch
+
+
 def require_session(event):
     token = get_token_from_event(event)
 
@@ -65,8 +76,10 @@ def require_session(event):
     if not session:
         return None, response(401, {"message": "Invalid session"})
 
-    return session, None
+    if session_is_expired(session):
+        return None, response(401, {"message": "Session expired"})
 
+    return session, None
 
 def decode_image_base64(image_base64):
     if "," in image_base64:
@@ -83,6 +96,20 @@ def get_file_extension(content_type):
         return "jpg"
 
     return None
+
+def jsonify(value):
+    if isinstance(value, list):
+        return [jsonify(item) for item in value]
+
+    if isinstance(value, dict):
+        return {key: jsonify(val) for key, val in value.items()}
+
+    if isinstance(value, Decimal):
+        if value % 1 == 0:
+            return int(value)
+        return float(value)
+
+    return value
 
 
 def decimalize(value):
@@ -454,6 +481,130 @@ def handle_process(event):
         )
 
 
+def handle_list_receipts(event):
+    session, error_response = require_session(event)
+
+    if error_response:
+        return error_response
+
+    result = receipts_table.query(
+        KeyConditionExpression=Key("userEmail").eq(session["email"]),
+        ScanIndexForward=False,
+    )
+
+    receipts = []
+
+    for item in result.get("Items", []):
+        receipts.append(
+            {
+                "receiptId": item.get("receiptId"),
+                "createdAt": item.get("createdAt"),
+                "updatedAt": item.get("updatedAt"),
+                "status": item.get("status"),
+                "storeName": item.get("storeName", ""),
+                "location": item.get("location", ""),
+                "subtotal": float(item.get("subtotal", 0)),
+                "tax": float(item.get("tax", 0)),
+                "total": float(item.get("total", 0)),
+                "itemsSold": int(item.get("itemsSold", 0)),
+                "schemaVersion": item.get("schemaVersion", "1.0"),
+            }
+        )
+
+    return response(200, {"receipts": receipts})
+
+
+def handle_get_receipt(event):
+    session, error_response = require_session(event)
+
+    if error_response:
+        return error_response
+
+    receipt_id = (event.get("pathParameters") or {}).get("receiptId")
+
+    if not receipt_id:
+        return response(400, {"message": "receiptId is required."})
+
+    result = receipts_table.get_item(
+        Key={
+            "userEmail": session["email"],
+            "receiptId": receipt_id,
+        }
+    )
+
+    receipt = result.get("Item")
+
+    if not receipt:
+        return response(404, {"message": "Receipt not found."})
+
+    return response(
+        200,
+        {
+            "receiptId": receipt.get("receiptId"),
+            "createdAt": receipt.get("createdAt"),
+            "updatedAt": receipt.get("updatedAt"),
+            "status": receipt.get("status"),
+            "imageS3Key": receipt.get("imageS3Key"),
+            "storeName": receipt.get("storeName", ""),
+            "location": receipt.get("location", ""),
+            "subtotal": float(receipt.get("subtotal", 0)),
+            "tax": float(receipt.get("tax", 0)),
+            "total": float(receipt.get("total", 0)),
+            "itemsSold": int(receipt.get("itemsSold", 0)),
+            "schemaVersion": receipt.get("schemaVersion", "1.0"),
+            "receiptJson": receipt.get("receiptJson", {}),
+            "processingError": receipt.get("processingError"),
+        },
+    )
+
+
+def handle_delete_receipt(event):
+    session, error_response = require_session(event)
+
+    if error_response:
+        return error_response
+
+    receipt_id = (event.get("pathParameters") or {}).get("receiptId")
+
+    if not receipt_id:
+        return response(400, {"message": "receiptId is required."})
+
+    result = receipts_table.get_item(
+        Key={
+            "userEmail": session["email"],
+            "receiptId": receipt_id,
+        }
+    )
+
+    receipt = result.get("Item")
+
+    if not receipt:
+        return response(404, {"message": "Receipt not found."})
+
+    image_s3_key = receipt.get("imageS3Key")
+
+    if image_s3_key:
+        s3.delete_object(
+            Bucket=receipt_images_bucket,
+            Key=image_s3_key,
+        )
+
+    receipts_table.delete_item(
+        Key={
+            "userEmail": session["email"],
+            "receiptId": receipt_id,
+        }
+    )
+
+    return response(
+        200,
+        {
+            "message": "Receipt deleted",
+            "receiptId": receipt_id,
+        },
+    )
+    
+
 def lambda_handler(event, context):
     route = event.get("rawPath")
     method = event.get("requestContext", {}).get("http", {}).get("method")
@@ -464,4 +615,14 @@ def lambda_handler(event, context):
     if route and route.startswith("/receipts/process/") and method == "POST":
         return handle_process(event)
 
+    if route == "/receipts" and method == "GET":
+        return handle_list_receipts(event)
+
+    if route and route.startswith("/receipts/") and method == "GET":
+        return handle_get_receipt(event)
+
+    if route and route.startswith("/receipts/") and method == "DELETE":
+        return handle_delete_receipt(event)
+
     return response(404, {"message": "Route not found."})
+

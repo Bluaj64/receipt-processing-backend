@@ -9,6 +9,7 @@ import boto3
 
 dynamodb = boto3.resource("dynamodb")
 s3 = boto3.client("s3")
+secrets_client = boto3.client("secretsmanager")
 
 receipts_table = dynamodb.Table(os.environ["RECEIPTS_TABLE"])
 sessions_table = dynamodb.Table(os.environ["SESSIONS_TABLE"])
@@ -126,9 +127,18 @@ def handle_upload(event):
             "receiptId": receipt_id,
             "createdAt": now,
             "updatedAt": now,
+
             "status": "IMAGE_UPLOADED",
+
             "imageS3Key": image_s3_key,
-            "contentType": content_type,
+
+            "storeName": None,
+            "receiptDate": None,
+            "subtotal": None,
+            "tax": None,
+            "total": None,
+
+            "receiptJson": None,
         }
     )
 
@@ -143,11 +153,70 @@ def handle_upload(event):
     )
 
 
+def get_openai_api_key():
+    secret_name = os.environ["OPENAI_SECRET_NAME"]
+
+    response = secrets_client.get_secret_value(
+        SecretId=secret_name
+    )
+
+    secret_json = json.loads(
+        response["SecretString"]
+    )
+
+    return secret_json["API_KEY"]
+
+
+def handle_process(event):
+    session, error_response = require_session(event)
+
+    if error_response:
+        return error_response
+
+    path_parameters = event.get("pathParameters") or {}
+    receipt_id = path_parameters.get("receiptId")
+
+    if not receipt_id:
+        return response(400, {"message": "receiptId is required."})
+
+    user_email = session["email"]
+
+    result = receipts_table.get_item(
+        Key={
+            "userEmail": user_email,
+            "receiptId": receipt_id,
+        }
+    )
+
+    receipt = result.get("Item")
+
+    if not receipt:
+        return response(404, {"message": "Receipt not found."})
+
+    if not receipt.get("imageS3Key"):
+        return response(400, {"message": "Receipt does not have an uploaded image."})
+
+    api_key = get_openai_api_key()
+
+    return response(
+        200,
+        {
+            "message": "Ready to process receipt with OpenAI.",
+            "receiptId": receipt_id,
+            "imageS3Key": receipt["imageS3Key"],
+            "hasApiKey": bool(api_key),
+        },
+    )
+
+
 def lambda_handler(event, context):
     route = event.get("rawPath")
     method = event.get("requestContext", {}).get("http", {}).get("method")
 
     if route == "/receipts/upload" and method == "POST":
         return handle_upload(event)
+
+    if route and route.startswith("/receipts/process/") and method == "POST":
+        return handle_process(event)
 
     return response(404, {"message": "Route not found."})

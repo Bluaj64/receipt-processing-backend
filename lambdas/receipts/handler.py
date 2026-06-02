@@ -2,6 +2,9 @@ import os
 import json
 import uuid
 import base64
+import urllib.request
+import urllib.error
+from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
@@ -14,6 +17,8 @@ secrets_client = boto3.client("secretsmanager")
 receipts_table = dynamodb.Table(os.environ["RECEIPTS_TABLE"])
 sessions_table = dynamodb.Table(os.environ["SESSIONS_TABLE"])
 receipt_images_bucket = os.environ["RECEIPT_IMAGES_BUCKET"]
+
+OPENAI_MODEL = "gpt-4o-mini"
 
 
 def response(status_code, body):
@@ -80,6 +85,172 @@ def get_file_extension(content_type):
     return None
 
 
+def decimalize(value):
+    if isinstance(value, list):
+        return [decimalize(item) for item in value]
+
+    if isinstance(value, dict):
+        return {key: decimalize(val) for key, val in value.items()}
+
+    if isinstance(value, float):
+        return Decimal(str(value))
+
+    return value
+
+
+def get_openai_api_key():
+    secret_name = os.environ["OPENAI_SECRET_NAME"]
+
+    secret_response = secrets_client.get_secret_value(SecretId=secret_name)
+    secret_json = json.loads(secret_response["SecretString"])
+
+    return secret_json["API_KEY"]
+
+
+def get_receipt_schema():
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schemaVersion",
+            "store",
+            "location",
+            "lineItems",
+            "summary",
+        ],
+        "properties": {
+            "schemaVersion": {
+                "type": "string",
+                "enum": ["1.0"],
+            },
+            "store": {
+                "type": "string",
+            },
+            "location": {
+                "type": "string",
+            },
+            "lineItems": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "id",
+                        "description",
+                        "category",
+                        "quantity",
+                        "unit",
+                        "unitPrice",
+                        "totalPrice",
+                    ],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "description": {"type": "string"},
+                        "category": {"type": "string"},
+                        "quantity": {"type": "number"},
+                        "unit": {"type": "string"},
+                        "unitPrice": {"type": "number"},
+                        "totalPrice": {"type": "number"},
+                    },
+                },
+            },
+            "summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "subtotal",
+                    "tax",
+                    "total",
+                    "itemsSold",
+                ],
+                "properties": {
+                    "subtotal": {"type": "number"},
+                    "tax": {"type": "number"},
+                    "total": {"type": "number"},
+                    "itemsSold": {"type": "integer"},
+                },
+            },
+        },
+    }
+
+
+def call_openai_receipt_extraction(api_key, image_data_url):
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "You extract structured receipt data from receipt images. "
+                            "Return only data visible or reasonably inferable from the receipt. "
+                            "Use empty strings for missing text. Use 0 for missing numbers. "
+                            "Categorize each line item into a short practical shopping category."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Extract this receipt into the required JSON schema.",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url,
+                    },
+                ],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "receipt_extraction",
+                "strict": True,
+                "schema": get_receipt_schema(),
+            }
+        },
+    }
+
+    request = urllib.request.Request(
+        url="https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as openai_response:
+            response_body = openai_response.read().decode("utf-8")
+            return json.loads(response_body)
+
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode("utf-8")
+        raise Exception(f"OpenAI API error {error.code}: {error_body}")
+
+
+def extract_output_json(openai_response):
+    for output in openai_response.get("output", []):
+        if output.get("type") != "message":
+            continue
+
+        for item in output.get("content", []):
+            if item.get("type") == "refusal":
+                raise Exception(f"OpenAI refused: {item.get('refusal')}")
+
+            if item.get("type") == "output_text":
+                return json.loads(item.get("text", "{}"))
+
+    raise Exception("Could not find structured output text in OpenAI response.")
+
+
 def handle_upload(event):
     session, error_response = require_session(event)
 
@@ -127,18 +298,18 @@ def handle_upload(event):
             "receiptId": receipt_id,
             "createdAt": now,
             "updatedAt": now,
-
             "status": "IMAGE_UPLOADED",
-
             "imageS3Key": image_s3_key,
-
-            "storeName": None,
-            "receiptDate": None,
-            "subtotal": None,
-            "tax": None,
-            "total": None,
-
-            "receiptJson": None,
+            "contentType": content_type,
+            "storeName": "",
+            "location": "",
+            "receiptDate": "",
+            "subtotal": Decimal("0"),
+            "tax": Decimal("0"),
+            "total": Decimal("0"),
+            "itemsSold": 0,
+            "schemaVersion": "1.0",
+            "receiptJson": {},
         }
     )
 
@@ -151,20 +322,6 @@ def handle_upload(event):
             "status": "IMAGE_UPLOADED",
         },
     )
-
-
-def get_openai_api_key():
-    secret_name = os.environ["OPENAI_SECRET_NAME"]
-
-    response = secrets_client.get_secret_value(
-        SecretId=secret_name
-    )
-
-    secret_json = json.loads(
-        response["SecretString"]
-    )
-
-    return secret_json["API_KEY"]
 
 
 def handle_process(event):
@@ -193,20 +350,108 @@ def handle_process(event):
     if not receipt:
         return response(404, {"message": "Receipt not found."})
 
-    if not receipt.get("imageS3Key"):
+    image_s3_key = receipt.get("imageS3Key")
+
+    if not image_s3_key:
         return response(400, {"message": "Receipt does not have an uploaded image."})
 
-    api_key = get_openai_api_key()
+    try:
+        s3_response = s3.get_object(
+            Bucket=receipt_images_bucket,
+            Key=image_s3_key,
+        )
 
-    return response(
-        200,
-        {
-            "message": "Ready to process receipt with OpenAI.",
-            "receiptId": receipt_id,
-            "imageS3Key": receipt["imageS3Key"],
-            "hasApiKey": bool(api_key),
-        },
-    )
+        image_bytes = s3_response["Body"].read()
+        content_type = receipt.get("contentType", "image/png")
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_data_url = f"data:{content_type};base64,{image_base64}"
+
+        api_key = get_openai_api_key()
+
+        openai_response = call_openai_receipt_extraction(
+            api_key=api_key,
+            image_data_url=image_data_url,
+        )
+
+        receipt_json = extract_output_json(openai_response)
+
+        summary = receipt_json.get("summary", {})
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        receipts_table.update_item(
+            Key={
+                "userEmail": user_email,
+                "receiptId": receipt_id,
+            },
+            UpdateExpression=(
+                "SET #status = :status, "
+                "updatedAt = :updatedAt, "
+                "schemaVersion = :schemaVersion, "
+                "receiptJson = :receiptJson, "
+                "storeName = :storeName, "
+                "#location = :location, "
+                "subtotal = :subtotal, "
+                "tax = :tax, "
+                "#total = :total, "
+                "itemsSold = :itemsSold "
+                "REMOVE processingError"
+            ),
+            ExpressionAttributeNames={
+                "#status": "status",
+                "#location": "location",
+                "#total": "total",
+            },
+            ExpressionAttributeValues={
+                ":status": "PROCESSED",
+                ":updatedAt": now,
+                ":schemaVersion": receipt_json.get("schemaVersion", "1.0"),
+                ":receiptJson": decimalize(receipt_json),
+                ":storeName": receipt_json.get("store", ""),
+                ":location": receipt_json.get("location", ""),
+                ":subtotal": Decimal(str(summary.get("subtotal", 0))),
+                ":tax": Decimal(str(summary.get("tax", 0))),
+                ":total": Decimal(str(summary.get("total", 0))),
+                ":itemsSold": int(summary.get("itemsSold", 0)),
+            },
+        )
+
+        return response(
+            200,
+            {
+                "message": "Receipt processed",
+                "receiptId": receipt_id,
+                "status": "PROCESSED",
+                "receipt": receipt_json,
+            },
+        )
+
+    except Exception as error:
+        print("Processing error:", str(error))
+
+        receipts_table.update_item(
+            Key={
+                "userEmail": user_email,
+                "receiptId": receipt_id,
+            },
+            UpdateExpression="SET #status = :status, updatedAt = :updatedAt, processingError = :processingError",
+            ExpressionAttributeNames={
+                "#status": "status",
+            },
+            ExpressionAttributeValues={
+                ":status": "PROCESSING_FAILED",
+                ":updatedAt": datetime.now(timezone.utc).isoformat(),
+                ":processingError": str(error),
+            },
+        )
+
+        return response(
+            500,
+            {
+                "message": "Receipt processing failed.",
+                "error": str(error),
+            },
+        )
 
 
 def lambda_handler(event, context):
